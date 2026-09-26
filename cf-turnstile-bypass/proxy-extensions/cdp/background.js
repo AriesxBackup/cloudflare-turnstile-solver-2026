@@ -17,7 +17,7 @@ let inject_config_content = null;
 let debugger_attached_tabs = new Set();
 
 // Maps tab ID -> the exact top-level URL the tab is navigating to.
-// Only requests matching this URL will be overridden; all others pass through untouched.
+// Only requests matching this URL will be overridden.
 let tab_pending_urls = new Map();
 
 // Load our state from local storage on script wakeup to prevent data loss after idling.
@@ -206,7 +206,7 @@ async function attach_debugger_to_tab(tab_id) {
             // Detach the existing session before re-attaching. Without this, Chrome still considers
             // the debugger attached even after we delete the tab from our local set, so the next
             // chrome.debugger.attach call throws "Another debugger is already attached" and the
-            // catch block swallows it — meaning Fetch.enable never runs and the override never fires.
+            // catch block swallows it--meaning Fetch.enable never runs and the override never fires.
             await chrome.debugger.detach({ tabId: tab_id }).catch(() => {});
             debugger_attached_tabs.delete(tab_id);
         }
