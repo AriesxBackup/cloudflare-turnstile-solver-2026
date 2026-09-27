@@ -248,7 +248,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 // but reloading the page immediately solves this issue so it's not really a big deal.
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
     if (!OVERRIDE_FILE_PATH) return;
-    if (details.frameId !== 0) return;
+    if (details.frameId != 0) return;
     tab_pending_urls.set(details.tabId, details.url);
     debugger_attached_tabs.delete(details.tabId);
     attach_debugger_to_tab(details.tabId);
@@ -258,11 +258,11 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
 // Only do this for the page itself that we navigate to, so no other sources are overridden.
 // This way the turnstile interface still works as expected.
 chrome.debugger.onEvent.addListener(async (source, method, params) => {
-    if (method !== "Fetch.requestPaused") return;
+    if (method != "Fetch.requestPaused") return;
     let tab_id = source.tabId;
     let pending_url = tab_pending_urls.get(tab_id);
 
-    if (!OVERRIDE_FILE_PATH || !pending_url || params.request.url !== pending_url) {
+    if (!OVERRIDE_FILE_PATH || !pending_url || params.request.url != pending_url) {
         chrome.debugger.sendCommand(source, "Fetch.continueRequest", { requestId: params.requestId });
         return;
     }
