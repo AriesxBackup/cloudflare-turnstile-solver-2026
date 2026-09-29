@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-const PORT: u16 = 8080;
+const PORT: u16 = 8081;
 
 type Tx = mpsc::UnboundedSender<Message>;
 

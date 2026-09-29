@@ -2,7 +2,7 @@
 
 const OVERRIDE_FILE_PATH = String.raw``;
 
-const INJECT_CONFIG_FILE_PATH = String.raw``;
+const INJECT_CONFIG_FILE_PATH = String.raw`http://127.0.0.1:8090/cf-turnstile-bypass/proxy-extensions/inject_config.txt`;
 
 // Object map for proxy ID info.
 let active_proxy = null;
@@ -201,6 +201,8 @@ load_inject_config_file();
 
 // Attach the debugger that listens for requests and overrides the target page file with our override to a tab.
 async function attach_debugger_to_tab(tab_id) {
+    // The debugger is only needed when we override a page with an override file.
+    if (!OVERRIDE_FILE_PATH) return;
     try {
         if (debugger_attached_tabs.has(tab_id)) {
             // Detach the existing session before re-attaching. Without this, Chrome still considers

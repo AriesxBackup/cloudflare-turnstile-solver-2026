@@ -5,8 +5,9 @@ chrome.runtime.onMessage.addListener((message, sender, send_response) => {
         let { file_path } = message;
 
         // Normalize the path into a file:// URL.
+        // Pass http(s) URLs through as-is; convert local paths to file://.
         let file_url = file_path;
-        if (!file_url.startsWith("file://")) {
+        if (!file_url.startsWith("file://") && !file_url.startsWith("http://") && !file_url.startsWith("https://")) {
             let normalized = file_path.replace(/\\/g, "/");
             file_url = normalized.startsWith("/") ? "file://" + normalized : "file:///" + normalized;
         }
@@ -31,8 +32,9 @@ chrome.runtime.onMessage.addListener((message, sender, send_response) => {
     let { file_path, request_id, tab_id } = message;
 
     // Normalize the path into a file:// URL.
+    // Pass http(s) URLs through as-is; convert local paths to file://.
     let file_url = file_path;
-    if (!file_url.startsWith("file://")) {
+    if (!file_url.startsWith("file://") && !file_url.startsWith("http://") && !file_url.startsWith("https://")) {
         let normalized = file_path.replace(/\\/g, "/");
         file_url = normalized.startsWith("/") ? "file://" + normalized : "file:///" + normalized;
     }

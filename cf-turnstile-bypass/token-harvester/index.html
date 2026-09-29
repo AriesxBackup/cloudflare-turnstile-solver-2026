@@ -32,6 +32,37 @@
         
         setTimeout(() => {
             (async () => {   
+                // --- Request-based config loading (extension-free) ---
+                // The cdp extension normally injects this config into localStorage
+                // via content scripts. If that hasn't happened (extension content
+                // scripts blocked, etc.), fetch the config file ourselves over HTTP.
+                async function ensure_config_loaded() {
+                    const has = (k) => localStorage[k] != null && localStorage[k] !== "";
+                    if (has("token_server_host") && has("sitekey")) return true;
+                    const cfg_url = new URLSearchParams(location.search).get("config")
+                        || new URL("../proxy-extensions/inject_config.txt", location.href).href;
+                    console.log("[harvester] Fetching config from " + cfg_url);
+                    const res = await fetch(cfg_url, { cache: "no-store" });
+                    if (!res.ok) throw new Error("config fetch failed: HTTP " + res.status);
+                    const text = await res.text();
+                    text.split("\n").forEach((line) => {
+                        line = line.trim();
+                        if (!line) return;
+                        const idx = line.indexOf(":");
+                        if (idx === -1) return;
+                        const key = line.slice(0, idx).trim().toLowerCase();
+                        const value = line.slice(idx + 1).trim();
+                        if (key) localStorage[key] = value;
+                    });
+                    console.log("[harvester] Config loaded from " + cfg_url);
+                    return has("token_server_host") && has("sitekey");
+                }
+                try {
+                    await ensure_config_loaded();
+                } catch (e) {
+                    console.error("[harvester] Config load failed:", e);
+                }
+
                 // Timeout for proxy to connect, in ms.
                 const PROXY_CONNECT_TIMEOUT = parseInt(localStorage.proxy_connect_timeout);
     
