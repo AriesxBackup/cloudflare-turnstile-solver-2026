@@ -20,6 +20,13 @@ RUN printf '#!/bin/sh\nexec xvfb-run -a /usr/bin/chromium "$@"\n' > /usr/local/b
     && chmod +x /usr/local/bin/solver-chrome
 
 WORKDIR /app
+WORKDIR /app
+ENV NODE_ENV=production
+# Safe defaults for this image (it runs as root): --no-sandbox is mandatory for
+# Chromium as root, --disable-dev-shm-usage avoids small /dev/shm. Deploy-time
+# service variables (Railway) override this ENV if a custom value is wanted.
+ENV CHROME_ARGS_EXTRA=--no-sandbox,--disable-dev-shm-usage,--disable-gpu
+
 ENV NODE_ENV=production
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev --no-audit --no-fund || npm install --omit=dev --no-audit --no-fund

@@ -291,7 +291,7 @@ docker compose logs -f solver
 
 The image (`node:22-bookworm-slim` + Chromium + Xvfb + `dumb-init`) runs hub, API and workers in one container. Worker state (fingerprint memory, Chrome profiles) lives in the `solver-state` volume mounted at `/app/.state`. Scale with `SOLVER_INSTANCES`; each worker is one Chromium (~250–400 MB RAM).
 
-The container runs as root, so `CHROME_ARGS_EXTRA` must include `--no-sandbox` (compose sets `--no-sandbox,--disable-dev-shm-usage,--disable-gpu`), and the bundled `solver-chrome` Xvfb wrapper makes the visible fingerprint fallback work without a real display.
+The container runs as root, so `CHROME_ARGS_EXTRA` must include `--no-sandbox` — the image ships that default (`--no-sandbox,--disable-dev-shm-usage,--disable-gpu`, override via deploy-time env if needed), and compose sets the same value explicitly. The bundled `solver-chrome` Xvfb wrapper makes the visible fingerprint fallback work without a real display.
 
 ## Railway
 
