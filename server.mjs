@@ -376,6 +376,10 @@ function spawnSolver(i) {
         env.CDP_BASE = `http://127.0.0.1:${CDP_PORT_BASE + i}`;
     }
     env.FALLBACK_CDP_PORT = String(FALLBACK_CDP_PORT_BASE + i);
+    // Per-instance profile dirs in the solver (Chrome locks user-data-dirs
+    // process-wide; without this, workers 2..N crash-loop on boot because
+    // worker 1's Chrome holds the shared profile directory).
+    env.SOLVER_INSTANCE = String(i);
     const child = spawn(process.execPath, [join(__dir, "solver.mjs")], { env, stdio: ["ignore", "inherit", "inherit"], windowsHide: true });
     children.set(i, child);
     log(`[svc] solver worker ${i} started (pid ${child.pid})`);

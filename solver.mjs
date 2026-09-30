@@ -65,7 +65,12 @@ const DEFAULT_CHROME_CANDIDATES = [
 const CHROME_PATH = DEFAULT_CHROME_CANDIDATES.find((p) => { try { return existsSync(p); } catch { return false; } }) || process.env.CHROME_PATH || "chromium";
 const SOLVER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
 const TURNSTILE_JS = "https://challenges.cloudflare.com/turnstile/v0/api.js";
-const MANAGED_PROFILE_DIR = join(__dir, ".state", "chrome-default");
+// Worker index (set by server.mjs per spawned worker). Chrome locks a
+// user-data-dir to a single running instance, so every worker needs its OWN
+// profile directories or all but the first worker fail to boot. Unset (0) in
+// standalone `node solver.mjs` runs -> legacy shared names, behavior unchanged.
+const SOLVER_INSTANCE = parseInt(process.env.SOLVER_INSTANCE || "", 10) || 0;
+const MANAGED_PROFILE_DIR = join(__dir, ".state", SOLVER_INSTANCE ? `chrome-default-${SOLVER_INSTANCE}` : "chrome-default");
 // Extra Chrome flags, comma-separated (e.g. "CHROME_ARGS_EXTRA=--no-sandbox,--disable-dev-shm-usage"
 // for Docker). Appended to every spawned Chrome.
 const CHROME_ARGS_EXTRA = (process.env.CHROME_ARGS_EXTRA || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -432,7 +437,7 @@ async function launchFallbackBrowser() {
     if (browsers.has(key)) return browsers.get(key);
     const port = FALLBACK_CDP_PORT || nextPort();
     if (FALLBACK_CDP_PORT) _port = Math.max(_port, port);
-    const dir = join(__dir, ".state", "chrome-fallback");
+    const dir = join(__dir, ".state", SOLVER_INSTANCE ? `chrome-fallback-${SOLVER_INSTANCE}` : "chrome-fallback");
     const b = await launchChrome({ name: "fallback", port, dir, extraArgs: [], headless: false });
     browsers.set(key, b);
     log("# visible fallback browser ready on http://127.0.0.1:" + port);
@@ -478,7 +483,7 @@ async function launchProxyBrowser(proxy) {
     const key = "proxy:" + createHash("sha1").update(proxy).digest("hex").slice(0, 12);
     if (browsers.has(key)) return browsers.get(key);
     const port = 0; // OS-assigned; avoids colliding with default/fallback CDP endpoints
-    const dir = join(__dir, ".state", "chrome-proxy-" + key.slice(6));
+    const dir = join(__dir, ".state", `chrome-proxy-${key.slice(6)}${SOLVER_INSTANCE ? "-" + SOLVER_INSTANCE : ""}`);
     const parsed = parseProxy(proxy) || { proxyServer: proxy, auth: null };
     // A stale profile can cache an old proxy password and make Chrome fail with
     // ERR_INVALID_AUTH_CREDENTIALS (observed in testing), so always launch with
