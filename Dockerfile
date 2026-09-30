@@ -32,9 +32,10 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev --no-audit --no-fund || npm install --omit=dev --no-audit --no-fund
 COPY server.mjs solver.mjs ./
 
-# Solver state (worker JSON, Chrome profiles) lives here; mount a volume to persist.
+# Solver state (worker JSON, Chrome profiles) lives here. Persist it by mounting
+# a volume at /app/.state (docker-compose does this; on Railway, attach a Volume
+# in the service settings - its builder rejects Dockerfile VOLUME directives).
 RUN mkdir -p /app/.state
-VOLUME ["/app/.state"]
 
 # Railway injects PORT automatically; server.mjs binds it.
 EXPOSE 8082

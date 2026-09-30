@@ -295,7 +295,7 @@ The container runs as root, so `CHROME_ARGS_EXTRA` must include `--no-sandbox` �
 
 ## Railway
 
-`railway.json` builds the Dockerfile, starts `node server.mjs`, and health-checks `/health` (300 s timeout, `ON_FAILURE` restarts). Railway injects `PORT` and the server binds it — just set `SOLVER_INSTANCES`, `API_KEY`, `DEFAULT_PROXY`, etc. as service variables. Use a larger instance size for many workers; RAM is the binding constraint.
+`railway.json` builds the Dockerfile, starts `node server.mjs`, and health-checks `/health` (300 s timeout, `ON_FAILURE` restarts). Railway injects `PORT` and the server binds it — just set `SOLVER_INSTANCES`, `API_KEY`, `DEFAULT_PROXY`, etc. as service variables. Use a larger instance size for many workers; RAM is the binding constraint. To persist worker state across deploys, attach a Railway Volume mounted at `/app/.state` (Railway's builder rejects Dockerfile `VOLUME` directives, so the image cannot declare it for you).
 
 ## Smoke test
 
