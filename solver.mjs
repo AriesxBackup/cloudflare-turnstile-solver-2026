@@ -205,9 +205,14 @@ class CdpBrowser {
     }
 
     async ensurePage(url) {
-        const { targetInfos } = await this.send("Target.getTargets", {}, false);
-        let t = targetInfos.find((x) => x.type === "page" && x.url.startsWith("http"));
+        let t = null;
+        try {
+            const { targetInfos } = await this.send("Target.getTargets", {}, false);
+            t = targetInfos.find((x) => x.type === "page" && x.url.startsWith("http"));
+        } catch {}
         if (!t) {
+            // No usable page target: either first boot or the previous one died
+            // (e.g. the OOM killer reaping the renderer). Create a fresh page.
             const { targetId } = await this.send("Target.createTarget", { url: "about:blank" }, false);
             t = { targetId, url: "about:blank", title: "" };
         }
@@ -492,6 +497,7 @@ async function launchProxyBrowser(proxy) {
     const b = await launchChrome({ name: "proxy:" + proxy, port, dir, extraArgs: ["--proxy-server=" + parsed.proxyServer] });
     b.proxy = proxy;
     b.proxyAuth = parsed.auth;
+    b.browserKey = key; // exact map key, so a dead proxy browser can be replaced
     browsers.set(key, b);
     log("# proxy browser ready on " + parsed.proxyServer + (b.proxyAuth ? " (auth enabled)" : ""));
     return b;
@@ -510,7 +516,8 @@ async function ensureBrowserConnected(b, key) {
             browsers.delete(key);
             return launchFallbackBrowser();
         }
-        browsers.delete(key);
+        const pkey = b.browserKey || key; // "proxy:<sha1>" map key, not the browser name
+        browsers.delete(pkey);
         return launchProxyBrowser(b.proxy);
     }
     await b.connect(); // throws if the endpoint is unreachable
@@ -587,10 +594,25 @@ async function handleSolveRequest(requesterId, proxy, fields) {
         let b = useProxy ? await launchProxyBrowser(effProxy)
             : wantFallback ? await launchFallbackBrowser() : defaultBrowser();
         b = await ensureBrowserConnected(b, key);
-        let out = await b.lock(async () => {
-            await b.ensurePage(url);
-            return b.solveTurnstile(sitekey, action);
-        });
+        let out = null;
+        try {
+            out = await b.lock(async () => {
+                await b.ensurePage(url);
+                return b.solveTurnstile(sitekey, action);
+            });
+        } catch (e) {
+            // Stale page/session (crashed renderer, dead CDP session, ...).
+            // Drop the cached target and retry once with a brand-new page.
+            logErr("[solver] solve attempt failed (" + e.message + "); retrying with a fresh page");
+            b.targetId = null;
+            b.sessionId = null;
+            b.widgetKey = "";
+            b.prewarmToken = null;
+            out = await b.lock(async () => {
+                await b.ensurePage(url);
+                return b.solveTurnstile(sitekey, action);
+            });
+        }
         if (!out.ok && !useProxy && HEADLESS === "1" && key !== "fallback" && /timeout/i.test(out.error || "")) {
             // Cloudflare's risk engine challenged the headless fingerprint.
             // Retry once with a visible browser, and remember the host so
