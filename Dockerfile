@@ -22,6 +22,9 @@ RUN printf '#!/bin/sh\nexec xvfb-run -a /usr/bin/chromium "$@"\n' > /usr/local/b
 WORKDIR /app
 WORKDIR /app
 ENV NODE_ENV=production
+# Server image default: bind all interfaces so `docker run -p` / PaaS routing
+# works out of the box (local dev via node/compose sets its own API_HOST).
+ENV API_HOST=0.0.0.0
 # Safe defaults for this image (it runs as root): --no-sandbox is mandatory for
 # Chromium as root, --disable-dev-shm-usage avoids small /dev/shm. Deploy-time
 # service variables (Railway) override this ENV if a custom value is wanted.
