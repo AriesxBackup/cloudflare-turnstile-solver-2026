@@ -167,7 +167,7 @@ Workers (read by `solver.mjs`; the hub sets `TOKEN_SERVER_URL`, `CDP_BASE`, `FAL
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HEADLESS` | `1` | `0` = spawn Chrome visible (also forced per-host after a fingerprint challenge). |
-| `MANAGE_BROWSER` | `1` | Worker launches/owns its Chrome at `CDP_BASE`. |
+| `MANAGE_BROWSER` | `1` | Worker launches/owns its Chrome at `CDP_BASE`; set `0` to attach to an external Chrome at `CDP_BASE` instead. |
 | `CHROME_PATH` | `chrome` on PATH | Browser binary (Docker image: `solver-chrome` Xvfb wrapper). |
 | `CHROME_ARGS_EXTRA` | unset | Extra Chrome flags, comma-separated (Docker needs `--no-sandbox,--disable-dev-shm-usage`). |
 | `DEFAULT_PROXY` | unset | Proxy for every solve with no `proxy` field; enables boot prewarm. |

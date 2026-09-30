@@ -46,7 +46,10 @@ const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10);
 const PREWARM_TIMEOUT_MS = parseInt(process.env.PREWARM_TIMEOUT_MS || "45000", 10);
 const PAGE_INIT_SLEEP_MS = parseInt(process.env.PAGE_INIT_SLEEP_MS || "400", 10);
 const HEADLESS = process.env.HEADLESS === undefined ? "1" : process.env.HEADLESS;
-const MANAGE_BROWSER = process.env.MANAGE_BROWSER === "1";
+// Managed by default: hub-spawned workers (and standalone `node solver.mjs`)
+// launch and own their Chrome at CDP_BASE. Set MANAGE_BROWSER=0 to attach to an
+// already-running external Chrome at CDP_BASE instead of launching one.
+const MANAGE_BROWSER = process.env.MANAGE_BROWSER !== "0";
 const DEFAULT_CHROME_CANDIDATES = [
     process.env.CHROME_PATH,
     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
