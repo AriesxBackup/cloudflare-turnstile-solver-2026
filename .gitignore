@@ -1,33 +1,13 @@
 # Node
 node_modules/
 
-# Logs and console captures
+# Logs
 *.log
 
-# Runtime artifacts
+# Runtime state (worker JSON, Chrome profiles, tokens)
+.state/
 turnstile_token.txt
-requester_*.txt
-harvester_mid.txt
-
-# Debug screenshots / captures
-*.png
-
-# Solver-managed Chrome profiles (headless default + visible fallback)
-.chrome-solver-default/
-.chrome-solver-fallback/
-
-# Chrome profiles from browser_launcher
-cf-turnstile-bypass/browser_launcher/browser_profiles/
-
-# Rust build output
-cf-turnstile-bypass/**/target/
-cf-turnstile-bypass/**/Cargo.lock
-
-# Scratch / working data
-targets/
-.kilo/
 
 # OS / editor
 .DS_Store
 Thumbs.db
-.vscode/

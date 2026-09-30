@@ -1,0 +1,13 @@
+# Keep the build context minimal (faster Railway/Docker builds).
+node_modules
+.git
+.state
+*.log
+*.png
+*.md
+LICENSE
+docker-compose.yml
+railway.json
+start_services.ps1
+stop_services.ps1
+.nvmrc

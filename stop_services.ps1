@@ -1,17 +1,18 @@
-# stop_services.ps1
-# Stops the solver, the API server, and any Chrome instances the solver spawned
-# (managed headless default browser + per-proxy browsers).
-
+# stop_services.ps1 - stops the service and any Chrome instances it spawned.
 $ErrorActionPreference = "SilentlyContinue"
 
-# Stop our node processes.
 Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-    Where-Object { $_.CommandLine -like "*cdp_solver.mjs*" -or $_.CommandLine -like "*api_server.mjs*" } |
+    Where-Object { $_.CommandLine -like "*server.mjs*" -or $_.CommandLine -like "*solver.mjs*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 
-# Stop Chrome instances launched by the solver (managed + fallback + proxy profiles).
-Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
-    Where-Object { $_.CommandLine -like "*chrome-solver*" -or $_.CommandLine -like "*browser_profiles*proxy_*" } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+# Solver-spawned Chrome (default + fallback + per-proxy profiles live under
+# .state\). Two sweeps: killing the main browser process leaves its children
+# running for a moment, so re-list and force-kill anything left.
+for ($pass = 0; $pass -lt 2; $pass++) {
+    Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+        Where-Object { $_.CommandLine -like "*.state*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 800
+}
 
-Write-Host "Stopped solver, api, and solver-spawned Chrome instances."
+Write-Host "Stopped service and solver-spawned Chrome instances."

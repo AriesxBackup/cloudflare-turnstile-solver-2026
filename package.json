@@ -1,0 +1,18 @@
+{
+  "name": "cloudflare-turnstile-solver",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted Cloudflare Turnstile token solver: WebSocket hub + HTTP API + real-Chrome CDP workers, in one deployable service.",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "solver": "node solver.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

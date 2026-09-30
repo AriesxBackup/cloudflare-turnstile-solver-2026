@@ -1,0 +1,28 @@
+# Single-container deployment: hub + HTTP API + solver workers in one process.
+# (Railway uses railway.json + the Dockerfile; this compose file is for local runs.)
+services:
+  solver:
+    build: .
+    image: turnstile-solver:latest
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    environment:
+      PORT: "8082"
+      API_HOST: 0.0.0.0
+      # Number of parallel solver workers (each = one Chrome); scale as needed.
+      SOLVER_INSTANCES: "1"
+      HEADLESS: "1"
+      CHROME_PATH: /usr/local/bin/solver-chrome
+      # --no-sandbox is required because the container runs as root;
+      # --disable-dev-shm-usage avoids /dev/shm being too small for Chrome.
+      CHROME_ARGS_EXTRA: --no-sandbox,--disable-dev-shm-usage,--disable-gpu
+      # Uncomment to require an API key on /solve:
+      # API_KEY: change-me
+      # Always-on proxy for every solve (host:port:user:pass or http://user:pass@host:port):
+      # DEFAULT_PROXY: ""
+    volumes:
+      - solver-state:/app/.state
+
+volumes:
+  solver-state:

@@ -1,18 +1,18 @@
-// cdp_solver.mjs
-// Token-server solver that mints Turnstile tokens for ANY domain-authorized
+// solver.mjs - solver worker (spawned by server.mjs, or run standalone).
+// Mints Turnstile tokens for ANY domain-authorized
 // sitekey by driving a real Chrome via CDP. The solve parameters arrive in the
 // header-1 forward packet as fields: url, sitekey, action. An optional proxy
 // field lazily launches a dedicated Chrome configured with --proxy-server.
 //
-// Protocol (see cf-turnstile-bypass/token-server/src/main.rs):
+// Hub protocol (see server.mjs; byte-compatible with the original Rust token-server):
 //   register: [2, ...ua_bytes]
 //   request:  [1, proxy_len(u8), ...proxy, requester_id(u32 LE),
 //              (name_len(u8), ...name, value_len(u8), ...value)*]
 //   result:   [0, requester_id(u32 LE), proxy_len(u8), ...proxy, ...token]
 //
-// Usage: node cdp_solver.mjs
+// Usage: node solver.mjs   (normally spawned and configured by server.mjs)
 // Env:    CDP_BASE         default Chrome debugging endpoint (default http://127.0.0.1:9222)
-//         TOKEN_SERVER_URL ws url of the token server (default ws://127.0.0.1:8081)
+//         TOKEN_SERVER_URL hub WebSocket url (set by server.mjs; default ws://127.0.0.1:8081)
 //         CHROME_PATH      chrome executable for proxy instances
 //         SOLVE_TIMEOUT_MS per-solve poll budget in the page (default 55000)
 //         NAV_TIMEOUT_MS   page navigation budget (default 45000)
@@ -20,6 +20,10 @@
 //         MANAGE_BROWSER   "1" lets the solver launch+own its own Chrome at CDP_BASE
 //         REQUEST_TIMEOUT_MS whole-request watchdog budget (default 110000)
 //         RECONNECT_MS     token-server reconnect delay (default 3000)
+//         DEFAULT_PROXY    proxy used for EVERY solve when the request's proxy
+//                          field is empty (always-on proxy). Colon form
+//                          host:port:user:pass or http://user:pass@host:port.
+//         PAGE_INIT_SLEEP_MS settle time after navigation (default 400)
 //
 // Production notes:
 //   * Survives token-server restarts: reconnects and re-registers automatically.
@@ -29,7 +33,7 @@
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync, rmSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 
 const __dir = dirname(fileURLToPath(import.meta.url));
@@ -39,12 +43,40 @@ const SOLVE_TIMEOUT_MS = parseInt(process.env.SOLVE_TIMEOUT_MS || "55000", 10);
 const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || "45000", 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "110000", 10);
 const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10);
+const PREWARM_TIMEOUT_MS = parseInt(process.env.PREWARM_TIMEOUT_MS || "45000", 10);
+const PAGE_INIT_SLEEP_MS = parseInt(process.env.PAGE_INIT_SLEEP_MS || "400", 10);
 const HEADLESS = process.env.HEADLESS === undefined ? "1" : process.env.HEADLESS;
 const MANAGE_BROWSER = process.env.MANAGE_BROWSER === "1";
-const CHROME_PATH = process.env.CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const DEFAULT_CHROME_CANDIDATES = [
+    process.env.CHROME_PATH,
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    "/usr/local/bin/solver-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+].filter(Boolean);
+// Pick the first Chrome/Chromium that exists on this machine (env override
+// always wins when it points at a real binary).
+const CHROME_PATH = DEFAULT_CHROME_CANDIDATES.find((p) => { try { return existsSync(p); } catch { return false; } }) || process.env.CHROME_PATH || "chromium";
 const SOLVER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
-const TURNSTILE_JS = "https://challenges.cloudflare.com/turnstile/api.js?render=explicit";
-const MANAGED_PROFILE_DIR = join(__dir, ".chrome-solver-default");
+const TURNSTILE_JS = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+const MANAGED_PROFILE_DIR = join(__dir, ".state", "chrome-default");
+// Extra Chrome flags, comma-separated (e.g. "CHROME_ARGS_EXTRA=--no-sandbox,--disable-dev-shm-usage"
+// for Docker). Appended to every spawned Chrome.
+const CHROME_ARGS_EXTRA = (process.env.CHROME_ARGS_EXTRA || "").split(",").map(s => s.trim()).filter(Boolean);
+// Fixed port for the visible fallback browser ("" = auto). Lets multiple solver
+// instances on one host use distinct ports (default 9230, fallback 9330+i).
+const FALLBACK_CDP_PORT = parseInt(process.env.FALLBACK_CDP_PORT || "0", 10) || 0;
+// Where the solver persists which hosts challenged the headless fingerprint and
+// the last solved target, so a restart skips the wasted 55s headless attempt and
+// can pre-warm the fallback browser. Empty string disables persistence.
+const STATE_FILE = process.env.SOLVER_STATE_FILE || join(__dir, ".state", "solver.json");
+// Always-on proxy: used for every solve when the request's proxy field is empty.
+// Enables boot-time prewarm (warm proxy browser + pre-minted token on the last
+// solved target) so even the first request after a restart is fast.
+const DEFAULT_PROXY = (process.env.DEFAULT_PROXY || "").trim();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -74,6 +106,9 @@ class CdpBrowser {
         this.pending = new Map();
         this.widgetKey = "";
         this.proc = null;
+        this.proxyAuth = null; // { username, password } for authenticated proxies
+        this.prewarmToken = null; // { key, token, at } token pre-minted at boot prewarm
+        this._lock = null; // per-browser mutex: prewarm and solves never interleave evals
     }
 
     async connect() {
@@ -84,6 +119,36 @@ class CdpBrowser {
             const raw = typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data);
             let msg;
             try { msg = JSON.parse(raw); } catch { return; }
+            if (msg.method === "Fetch.authRequired" && this.proxyAuth) {
+                // Chrome cannot take proxy credentials from --proxy-server, so we
+                // answer the proxy's 407 auth challenge via the Fetch domain.
+                this.ws.send(JSON.stringify({
+                    id: ++this.msgId,
+                    sessionId: msg.sessionId,
+                    method: "Fetch.continueWithAuth",
+                    params: {
+                        requestId: msg.params.requestId,
+                        authChallengeResponse: {
+                            response: "ProvideCredentials",
+                            username: this.proxyAuth.username,
+                            password: this.proxyAuth.password,
+                        },
+                    },
+                }));
+                return;
+            }
+            if (msg.method === "Fetch.requestPaused" && this.proxyAuth) {
+                // Fetch.enable uses an "*" pattern (required for authRequired to
+                // fire), so every request is paused at the Request stage; resume
+                // each one immediately.
+                this.ws.send(JSON.stringify({
+                    id: ++this.msgId,
+                    sessionId: msg.sessionId,
+                    method: "Fetch.continueRequest",
+                    params: { requestId: msg.params.requestId },
+                }));
+                return;
+            }
             if (msg.id && this.pending.has(msg.id)) {
                 const p = this.pending.get(msg.id);
                 this.pending.delete(msg.id);
@@ -116,6 +181,21 @@ class CdpBrowser {
         return res.result?.value;
     }
 
+    // Serialize page-driving work so prewarm and solve never interleave evals on
+    // one page. Top-level page operations (ensurePage + solveTurnstile and the
+    // boot prewarm) must run inside lock().
+    async lock(fn) {
+        const prev = this._lock;
+        let release;
+        this._lock = new Promise((r) => { release = r; });
+        if (prev) await prev.catch(() => {});
+        try {
+            return await fn();
+        } finally {
+            release();
+        }
+    }
+
     async ensurePage(url) {
         const { targetInfos } = await this.send("Target.getTargets", {}, false);
         let t = targetInfos.find((x) => x.type === "page" && x.url.startsWith("http"));
@@ -128,7 +208,17 @@ class CdpBrowser {
             const { sessionId } = await this.send("Target.attachToTarget", { targetId: t.targetId, flatten: true }, false);
             this.sessionId = sessionId;
             this.widgetKey = "";
+            this.prewarmToken = null; // new target -> any pre-minted token is gone
             await this.send("Page.enable", {}).catch(() => {});
+            await this.maskAutomation();
+            if (this.proxyAuth) {
+                // Intercept auth challenges so requests through an authenticated
+                // proxy can be answered with the credentials. An "*" Request-stage
+                // pattern is REQUIRED: without it Chromium never wires up the auth
+                // handler and 407s die with ERR_INVALID_AUTH_CREDENTIALS. Every
+                // paused request is resumed immediately by the onmessage handler.
+                await this.send("Fetch.enable", { handleAuthRequests: true, patterns: [{ urlPattern: "*" }] }).catch(() => {});
+            }
         }
         const cur = (await this.eval("location.href").catch(() => "")) || t.url || "";
         if (this.isSameTarget(cur, url)) {
@@ -139,13 +229,14 @@ class CdpBrowser {
         const t0 = Date.now();
         let ok = false;
         while (Date.now() - t0 < NAV_TIMEOUT_MS) {
-            await sleep(500);
+            await sleep(200);
             const state = await this.eval("({ready: document.readyState, href: location.href})").catch(() => null);
             if (state && state.ready === "complete" && /^https?:/i.test(state.href)) { ok = true; break; }
         }
         if (!ok) throw new Error("navigation to " + url + " did not complete");
-        await sleep(1500); // let page scripts initialize
+        await sleep(PAGE_INIT_SLEEP_MS); // let page scripts initialize
         this.widgetKey = ""; // new document -> any cached widget is gone
+        this.prewarmToken = null; // new document -> any pre-minted token is gone
         this.pageUrl = await this.eval("location.href").catch(() => url);
     }
 
@@ -155,6 +246,20 @@ class CdpBrowser {
             catch { return u.replace(/\/+$/, ""); }
         };
         return /^https?:/i.test(a) && norm(a) === norm(b);
+    }
+
+    // Blunt the classic "automation" signals a real browser would not expose:
+    // navigator.webdriver, missing chrome.runtime, and stock navigator fields.
+    // Injected into every new document + the current one. Best-effort only.
+    async maskAutomation() {
+        const MASK = `(() => {
+            try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+            try { window.chrome = window.chrome || { runtime: {} }; } catch (e) {}
+            try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
+            try { Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] }); } catch (e) {}
+        })()`;
+        await this.send("Page.addScriptToEvaluateOnNewDocument", { source: MASK }).catch(() => {});
+        await this.eval(MASK).catch(() => {});
     }
 
     async ensureTurnstile() {
@@ -183,6 +288,7 @@ class CdpBrowser {
             "!!(window.__apiSolver && window.__apiSolver.wid && document.getElementById('api-solver-host'))"
         ).catch(() => false);
         if (this.widgetKey === key && present) return;
+        this.prewarmToken = null; // re-rendering the widget invalidates any pre-minted token
         await this.eval(`(() => {
             const old = document.getElementById('api-solver-host');
             if (old) old.remove();
@@ -206,17 +312,28 @@ class CdpBrowser {
     }
 
     async solveTurnstile(sitekey, action) {
+        const key = sitekey + "|" + (action || "");
+        // Fast path: consume a token that was pre-minted at boot prewarm (target
+        // was already loaded and the widget already executed, so the answer is
+        // available before the request even arrived).
+        if (this.prewarmToken && this.prewarmToken.key === key && Date.now() - this.prewarmToken.at < 90000) {
+            const t = this.prewarmToken.token;
+            this.prewarmToken = null;
+            console.log("# [" + this.name + "] using pre-minted token");
+            return { ok: true, token: t };
+        }
+        this.prewarmToken = null;
         await this.ensureTurnstile();
         await this.primeWidget(sitekey, action);
         const out = await this.eval(`(async () => {
             const S = window.__apiSolver;
             if (!S || !S.wid) return { ok: false, error: 'widget not found' };
             try { turnstile.reset(S.wid); } catch (e) { return { ok: false, error: 'reset: ' + e.message }; }
-            await new Promise(r => setTimeout(r, 800));
+            await new Promise(r => setTimeout(r, 250));
             try { turnstile.execute(S.wid); } catch (e) { return { ok: false, error: 'execute: ' + e.message }; }
             const t0 = Date.now();
             while (Date.now() - t0 < ${SOLVE_TIMEOUT_MS}) {
-                await new Promise(r => setTimeout(r, 400));
+                await new Promise(r => setTimeout(r, 150));
                 let tok = null;
                 try { tok = turnstile.getResponse(S.wid); } catch (e) {}
                 if (tok) return { ok: true, token: tok };
@@ -248,20 +365,47 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
         "--disable-background-networking", "--disable-background-timer-throttling",
         "--disable-popup-blocking", "--disable-hang-monitor", "--disable-sync",
         "--metrics-recording-only", "--mute-audio",
+        "--disable-blink-features=AutomationControlled",
         "--remote-allow-origins=*",
         ...(useHeadless ? ["--headless=new", "--hide-scrollbars"] : []),
         ...extraArgs,
+        ...CHROME_ARGS_EXTRA,
         "about:blank",
     ];
     mkdirSync(dir, { recursive: true });
-    log("# launching Chrome (" + (useHeadless ? "headless" : "visible") + ") on port " + port);
+    log("# launching Chrome (" + (useHeadless ? "headless" : "visible") + ") on port " + (port || "auto"));
     const proc = spawn(CHROME_PATH, args, { stdio: "ignore", windowsHide: true });
     proc.on("error", (e) => logErr("# chrome spawn error:", e.message));
-    const base = "http://127.0.0.1:" + port;
-    const t0 = Date.now();
-    while (Date.now() - t0 < 30000) {
-        try { if ((await fetch(base + "/json/version")).ok) break; } catch {}
-        await sleep(400);
+    let base;
+    if (port === 0) {
+        // OS-assigned debugging port (used for proxy browsers so they can never
+        // collide with the default/fallback CDP endpoints): Chrome writes the
+        // actual port to <user-data-dir>/DevToolsActivePort shortly after launch.
+        // Remove any stale file first so a locked/relaunched profile can never
+        // make us attach to an old, dead endpoint.
+        const dpFile = join(dir, "DevToolsActivePort");
+        try { unlinkSync(dpFile); } catch {}
+        const t0 = Date.now();
+        while (Date.now() - t0 < 30000) {
+            if (proc.exitCode !== null) {
+                throw new Error("chrome exited (code " + proc.exitCode + ") before publishing a DevTools port - profile dir locked by another instance?");
+            }
+            try {
+                const line = readFileSync(dpFile, "utf8").split(/[\r\n]+/, 1)[0].trim();
+                if (line && Number.isInteger(+line) && +line > 0) { port = +line; break; }
+            } catch {}
+            await sleep(100);
+        }
+        if (!port) throw new Error("chrome did not publish a DevToolsActivePort (auto port)");
+        base = "http://127.0.0.1:" + port;
+        log("# browser \"" + name + "\" published DevTools port " + port);
+    } else {
+        base = "http://127.0.0.1:" + port;
+        const t0 = Date.now();
+        while (Date.now() - t0 < 30000) {
+            try { if ((await fetch(base + "/json/version")).ok) break; } catch {}
+            await sleep(400);
+        }
     }
     const b = new CdpBrowser(name, base);
     b.proc = proc;
@@ -271,6 +415,7 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
 
 async function launchManagedDefaultBrowser() {
     const port = new URL(DEFAULT_CDP).port || 9222;
+    _port = Math.max(_port, port); // nextPort() must never hand out the default CDP port
     const b = await launchChrome({ name: "default", port, dir: MANAGED_PROFILE_DIR, extraArgs: [] });
     browsers.set("default", b);
     log("# managed default browser ready on http://127.0.0.1:" + port);
@@ -282,23 +427,65 @@ async function launchManagedDefaultBrowser() {
 async function launchFallbackBrowser() {
     const key = "fallback";
     if (browsers.has(key)) return browsers.get(key);
-    const port = nextPort();
-    const dir = join(__dir, ".chrome-solver-fallback");
+    const port = FALLBACK_CDP_PORT || nextPort();
+    if (FALLBACK_CDP_PORT) _port = Math.max(_port, port);
+    const dir = join(__dir, ".state", "chrome-fallback");
     const b = await launchChrome({ name: "fallback", port, dir, extraArgs: [], headless: false });
     browsers.set(key, b);
     log("# visible fallback browser ready on http://127.0.0.1:" + port);
     return b;
 }
 
+// Normalize a proxy string from the token-server into (a) a Chrome-safe
+// --proxy-server value WITHOUT credentials (Chrome rejects userinfo in proxy
+// URLs with ERR_NO_SUPPORTED_PROXIES) and (b) the credentials used to answer
+// the proxy's 407 challenge via the Fetch domain. Accepts both
+//   http://user:pass@host:port      (URL form)
+//   host:port:user:pass             (colon form)
+// and plain host:port.
+function parseProxy(proxy) {
+    if (!proxy) return null;
+    const p = proxy.trim();
+    if (!p) return null;
+    let proxyServer = "";
+    let user = "";
+    let pass = "";
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(p)) {
+        const u = new URL(p);
+        user = decodeURIComponent(u.username || "");
+        pass = decodeURIComponent(u.password || "");
+        proxyServer = u.origin; // scheme://host:port (or scheme://host)
+    } else {
+        const parts = p.split("@").pop().split(":");
+        // parts may be [host, port] | [host, port, user] | [host, port, user, pass]
+        if (parts.length >= 3) {
+            proxyServer = "http://" + parts[0] + ":" + parts[1];
+            user = decodeURIComponent(parts[2] || "");
+            pass = decodeURIComponent(parts.slice(3).join(":") || "");
+        } else if (parts.length === 2) {
+            proxyServer = "http://" + parts[0] + ":" + parts[1];
+        } else {
+            proxyServer = "http://" + p;
+        }
+    }
+    return { proxyServer, auth: user ? { username: user, password: pass } : null };
+}
+
 async function launchProxyBrowser(proxy) {
     const key = "proxy:" + createHash("sha1").update(proxy).digest("hex").slice(0, 12);
     if (browsers.has(key)) return browsers.get(key);
-    const port = nextPort();
-    const dir = join(__dir, "cf-turnstile-bypass", "browser_launcher", "browser_profiles", "proxy_" + key.slice(6));
-    const b = await launchChrome({ name: "proxy:" + proxy, port, dir, extraArgs: ["--proxy-server=" + proxy] });
+    const port = 0; // OS-assigned; avoids colliding with default/fallback CDP endpoints
+    const dir = join(__dir, ".state", "chrome-proxy-" + key.slice(6));
+    const parsed = parseProxy(proxy) || { proxyServer: proxy, auth: null };
+    // A stale profile can cache an old proxy password and make Chrome fail with
+    // ERR_INVALID_AUTH_CREDENTIALS (observed in testing), so always launch with
+    // a fresh profile directory.
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+    const b = await launchChrome({ name: "proxy:" + proxy, port, dir, extraArgs: ["--proxy-server=" + parsed.proxyServer] });
     b.proxy = proxy;
+    b.proxyAuth = parsed.auth;
     browsers.set(key, b);
-    log("# proxy browser ready on http://127.0.0.1:" + port);
+    log("# proxy browser ready on " + parsed.proxyServer + (b.proxyAuth ? " (auth enabled)" : ""));
     return b;
 }
 
@@ -347,36 +534,72 @@ function queueSolve(fn) {
 
 const fallbackHosts = new Set(); // origins Cloudflare serves interactive challenges to in headless
 
+// ---- persisted solver state (fallback-challenged hosts + last solved target) ----
+// Lets a restart skip the wasted headless attempt for known-challenged hosts and
+// pre-warm the fallback browser so the first solve after boot is already warm.
+let solverState = { fallbackHosts: [], lastTarget: null };
+function loadState() {
+    if (!STATE_FILE) return;
+    try {
+        const raw = readFileSync(STATE_FILE, "utf8").replace(/^\uFEFF/, ""); // tolerate BOM (PowerShell -Encoding UTF8)
+        solverState = JSON.parse(raw);
+    } catch {}
+    if (!solverState || typeof solverState !== "object") solverState = { fallbackHosts: [], lastTarget: null };
+    if (!Array.isArray(solverState.fallbackHosts)) solverState.fallbackHosts = [];
+    for (const h of solverState.fallbackHosts) if (typeof h === "string") fallbackHosts.add(h);
+}
+function saveState() {
+    if (!STATE_FILE) return;
+    try { writeFileSync(STATE_FILE, JSON.stringify(solverState, null, 2), "utf8"); } catch (e) { logErr("[solver] state save failed:", e.message); }
+}
+
 async function handleSolveRequest(requesterId, proxy, fields) {
     const url = (fields.url || "").trim();
     const sitekey = (fields.sitekey || "").trim();
     const action = (fields.action || "").trim();
-    log("[solver] solve req " + requesterId + ": url=" + url + " sitekey=" + sitekey + " action=" + (action || "(none)") + " proxy=" + (proxy || "(none)"));
+    // Always-on proxy: when the request omits a proxy, fall back to the
+    // configured default so EVERY solve goes through the proxy.
+    const effProxy = (proxy || DEFAULT_PROXY).trim();
+    const useProxy = !!effProxy;
+    log("[solver] solve req " + requesterId + ": url=" + url + " sitekey=" + sitekey + " action=" + (action || "(none)") + " proxy=" + (proxy || "(none)") + (useProxy && !proxy ? " (default proxy on)" : ""));
     let token = null;
     let error = null;
     const worker = (async () => {
         if (!/^https?:\/\//i.test(url)) throw new Error("invalid or missing url field");
-        if (!/^0x[A-Za-z0-9_-]{20,}$/.test(sitekey)) throw new Error("invalid or missing sitekey field");
+        if (!/^[0-3]x[A-Za-z0-9_-]{20,}$/.test(sitekey)) throw new Error("invalid or missing sitekey field");
         let origin = "";
         try { origin = new URL(url).origin; } catch {}
-        const wantFallback = !proxy && HEADLESS === "1" && fallbackHosts.has(origin);
-        const key = proxy ? "proxy:" + proxy : (wantFallback ? "fallback" : "default");
-        let b = proxy ? await launchProxyBrowser(proxy)
+        // Remember the target even if this solve fails, so a restart can pre-warm
+        // the proxy browser against the same page.
+        solverState.lastTarget = { url, sitekey, action };
+        saveState();
+        const wantFallback = !useProxy && HEADLESS === "1" && fallbackHosts.has(origin);
+        log("[solver] solve " + requesterId + " -> " + (wantFallback ? "FALLBACK (known challenged host)" : (useProxy ? "proxy browser" : "default headless")) + " | known=[" + [...fallbackHosts].join(",") + "]");
+        const key = useProxy ? "proxy:" + effProxy : (wantFallback ? "fallback" : "default");
+        let b = useProxy ? await launchProxyBrowser(effProxy)
             : wantFallback ? await launchFallbackBrowser() : defaultBrowser();
         b = await ensureBrowserConnected(b, key);
-        await b.ensurePage(url);
-        let out = await b.solveTurnstile(sitekey, action);
-        if (!out.ok && !proxy && HEADLESS === "1" && /timeout/i.test(out.error || "")) {
+        let out = await b.lock(async () => {
+            await b.ensurePage(url);
+            return b.solveTurnstile(sitekey, action);
+        });
+        if (!out.ok && !useProxy && HEADLESS === "1" && key !== "fallback" && /timeout/i.test(out.error || "")) {
             // Cloudflare's risk engine challenged the headless fingerprint.
             // Retry once with a visible browser, and remember the host so
             // subsequent requests go straight to the fallback (~13 s) instead of
             // burning the headless poll budget first.
-            if (origin) fallbackHosts.add(origin);
+            if (origin) {
+                fallbackHosts.add(origin);
+                solverState.fallbackHosts = [...fallbackHosts];
+                saveState();
+            }
             log("[solver] headless solve blocked for " + origin + " (" + out.error + "); trying visible fallback");
             try {
                 const fb = await ensureBrowserConnected(await launchFallbackBrowser(), "fallback");
-                await fb.ensurePage(url);
-                out = await fb.solveTurnstile(sitekey, action);
+                out = await fb.lock(async () => {
+                    await fb.ensurePage(url);
+                    return fb.solveTurnstile(sitekey, action);
+                });
             } catch (e) {
                 logErr("[solver] fallback browser failed:", e.message);
                 error = e.message;
@@ -391,12 +614,20 @@ async function handleSolveRequest(requesterId, proxy, fields) {
     ]);
     if (verdict === "timeout") {
         error = "solve timed out after " + REQUEST_TIMEOUT_MS + " ms (watchdog)";
-        try { defaultBrowser().widgetKey = ""; } catch {} // stale page state; next request re-primes
+        // Stale page state: any browser mid-poll must re-prime next time.
+        for (const b of browsers.values()) {
+            try { b.widgetKey = ""; } catch {}
+        }
     }
-    if (token) log("[solver] got token len " + token.length + " for requester " + requesterId);
+    if (token) {
+        solverState.lastTarget = { url, sitekey, action };
+        saveState();
+        log("[solver] got token len " + token.length + " for requester " + requesterId);
+    }
     else logErr("[solver] solve failed for requester " + requesterId + ": " + error);
     if (solverWs && solverWs.readyState === 1) {
-        solverWs.send(buildResultPacket(requesterId, proxy || "", token));
+        // Echo the proxy that was actually used (may be the always-on default).
+        solverWs.send(buildResultPacket(requesterId, useProxy ? effProxy : proxy || "", token));
         log("[solver] result sent", token ? "WITH token" : "FAIL");
     }
 }
@@ -471,11 +702,84 @@ function shutdown() {
     setTimeout(() => process.exit(0), 500);
 }
 
+// After boot, if the previous run had to use the visible fallback for a host,
+// pre-warm the fallback browser (page + widget) so the first solve after a
+// restart is already warm instead of paying launch + navigate + prime + 55s poll.
+// Awaited during boot (with a cap) so it can never race a solve on the same page.
+async function prewarmFallback() {
+    const lt = solverState.lastTarget;
+    if (!lt || !solverState.fallbackHosts.length) return;
+    let origin = "";
+    try { origin = new URL(lt.url).origin; } catch {}
+    if (!origin || !fallbackHosts.has(origin)) return;
+    if (HEADLESS !== "1") return;
+    try {
+        await Promise.race([
+            (async () => {
+                const fb = await launchFallbackBrowser();
+                await fb.ensurePage(lt.url);
+                await fb.ensureTurnstile();
+                await fb.primeWidget(lt.sitekey, lt.action);
+            })(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("prewarm timed out after " + PREWARM_TIMEOUT_MS + " ms")), PREWARM_TIMEOUT_MS)),
+        ]);
+        log("[solver] fallback pre-warmed with", lt.url, "sitekey=" + lt.sitekey, "action=" + (lt.action || "(none)"));
+    } catch (e) {
+        logErr("[solver] fallback pre-warm failed:", e.message);
+    }
+}
+
+// If an always-on proxy is configured, warm a proxy browser on the last solved
+// target at boot (navigate + load turnstile + render the widget) so the first
+// request after a restart is already fast. When the target wasn't challenged by
+// Cloudflare, the widget is ALSO executed once so a pre-minted token is ready
+// before the request even arrives (near-instant first solve).
+async function prewarmProxy() {
+    if (!DEFAULT_PROXY) return;
+    const lt = solverState.lastTarget;
+    if (!lt || !/^https?:\/\//i.test(lt.url)) return;
+    try {
+        await Promise.race([
+            (async () => {
+                const b = await launchProxyBrowser(DEFAULT_PROXY);
+                const tok = await b.lock(async () => {
+                    await b.ensurePage(lt.url);
+                    await b.ensureTurnstile();
+                    await b.primeWidget(lt.sitekey, lt.action);
+                    return b.eval(`(async () => {
+                        const S = window.__apiSolver;
+                        if (!S || !S.wid) return "";
+                        try { turnstile.reset(S.wid); } catch (e) { return ""; }
+                        await new Promise(r => setTimeout(r, 250));
+                        try { turnstile.execute(S.wid); } catch (e) { return ""; }
+                        const t0 = Date.now();
+                        while (Date.now() - t0 < 10000) {
+                            await new Promise(r => setTimeout(r, 200));
+                            try { const t = turnstile.getResponse(S.wid); if (t) return t; } catch (e) {}
+                        }
+                        return "";
+                    })()`).catch(() => "");
+                });
+                if (tok) {
+                    b.prewarmToken = { key: lt.sitekey + "|" + (lt.action || ""), token: tok, at: Date.now() };
+                    log("[solver] proxy pre-warmed with a pre-minted token for", lt.url);
+                } else {
+                    log("[solver] proxy pre-warmed (widget ready, no instant token) for", lt.url);
+                }
+            })(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("proxy prewarm timed out after " + PREWARM_TIMEOUT_MS + " ms")), PREWARM_TIMEOUT_MS)),
+        ]);
+    } catch (e) {
+        logErr("[solver] proxy pre-warm failed:", e.message);
+    }
+}
+
 // ---------- boot ----------
 (async () => {
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
     process.on("exit", cleanupProcs);
+    loadState();
 
     if (MANAGE_BROWSER) {
         await launchManagedDefaultBrowser();
@@ -496,6 +800,7 @@ function shutdown() {
     setInterval(() => {
         try { if (solverWs && solverWs.readyState === 1) solverWs.send(new Uint8Array([255])); } catch {}
     }, 15000);
+    prewarmProxy(); // fire-and-forget; serialized with solves via the per-browser lock
 })().catch((e) => {
     logErr("[solver] boot failed:", e.message);
     process.exit(1);
