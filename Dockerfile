@@ -41,5 +41,7 @@ COPY server.mjs solver.mjs ./
 RUN mkdir -p /app/.state
 
 # Railway injects PORT automatically; server.mjs binds it.
-EXPOSE 8082
+# Do NOT EXPOSE a fixed port here: Railway injects PORT dynamically (e.g. 8080)
+# and the server binds it. A hardcoded EXPOSE can prefill the wrong target port
+# when generating a Railway domain (edge -> 502 if it mismatches $PORT).
 CMD ["dumb-init", "node", "server.mjs"]
