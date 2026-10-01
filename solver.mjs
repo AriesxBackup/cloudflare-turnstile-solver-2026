@@ -401,9 +401,18 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
         "about:blank",
     ];
     mkdirSync(dir, { recursive: true });
+    log("config: chrome=" + CHROME_PATH + " headless=" + HEADLESS + " args=" + [...CHROME_ARGS_EXTRA, ...extraArgs].join(" "));
     log("# launching Chrome (" + (useHeadless ? "headless" : "visible") + ") on port " + (port || "auto"));
     const proc = spawn(CHROME_PATH, args, { stdio: "ignore", windowsHide: true });
     proc.on("error", (e) => logErr("# chrome spawn error:", e.message));
+    // Keep the last ~4 KB of Chrome's stderr so an early crash (SIGSEGV/133/etc.)
+    // can report the REAL FATAL line instead of an opaque exit code.
+    let stderrBuf = "";
+    if (proc.stderr) proc.stderr.on("data", (d) => { stderrBuf = (stderrBuf + d.toString()).slice(-4096); });
+    const died = (prefix) => {
+        const tail = stderrBuf.split(/\r?\n/).map(s => s.trim()).filter(Boolean).slice(-6).join(" | ");
+        return new Error(prefix + (tail ? " | chrome stderr: " + tail.slice(0, 700) : ""));
+    };
     let base;
     if (port === 0) {
         // OS-assigned debugging port (used for proxy browsers so they can never
@@ -416,7 +425,7 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
         const t0 = Date.now();
         while (Date.now() - t0 < 30000) {
             if (proc.exitCode !== null) {
-                throw new Error("chrome exited (code " + proc.exitCode + ") before publishing a DevTools port - profile dir locked by another instance?");
+                throw died("chrome exited (code " + proc.exitCode + ") before publishing a DevTools port - profile dir locked by another instance?");
             }
             try {
                 const line = readFileSync(dpFile, "utf8").split(/[\r\n]+/, 1)[0].trim();
@@ -432,7 +441,7 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
         const t0 = Date.now();
         while (Date.now() - t0 < 30000) {
             if (proc.exitCode !== null) {
-                throw new Error("chrome exited (code " + proc.exitCode + ") before serving DevTools on port " + port);
+                throw died("chrome exited (code " + proc.exitCode + ") before serving DevTools on port " + port);
             }
             try { if ((await fetch(base + "/json/version")).ok) break; } catch {}
             await sleep(400);
@@ -872,6 +881,7 @@ async function prewarmProxy() {
     process.on("SIGTERM", shutdown);
     process.on("exit", cleanupProcs);
     loadState();
+    log("[solver] boot: instance=" + SOLVER_INSTANCE + " headless=" + HEADLESS + " chrome=" + CHROME_PATH + " default_proxy=" + (DEFAULT_PROXY ? "SET" : "none") + " cdp=" + DEFAULT_CDP + " args=" + (CHROME_ARGS_EXTRA.join(" ") || "(none)"));
 
     if (MANAGE_BROWSER) {
         await launchManagedDefaultBrowser();

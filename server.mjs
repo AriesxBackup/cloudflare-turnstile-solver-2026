@@ -33,7 +33,7 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { WebSocketServer } from "ws";
 
 const __dir = dirname(fileURLToPath(import.meta.url));
@@ -305,6 +305,39 @@ GET  /health -> {"ok":true,"solvers_available":N,...}
 GET  /       -> this text
 `;
 
+// Runtime diagnostics for /health: env knobs, container memory ceiling/usage,
+// and how many Chromium processes are alive. Lets a probe distinguish "Chrome
+// died from memory pressure" from other launch failures on a PaaS host.
+function sysDiag() {
+    const out = { env: {} };
+    for (const k of ["SOLVER_INSTANCES", "HEADLESS", "CHROME_ARGS_EXTRA", "DEFAULT_PROXY", "CDP_PORT_BASE", "FALLBACK_CDP_PORT_BASE", "MANAGE_BROWSER", "CHROME_PATH", "SOLVE_TIMEOUT_MS", "REQUEST_TIMEOUT_MS", "NAV_TIMEOUT_MS"]) {
+        if (process.env[k] !== undefined) out.env[k] = process.env[k].slice(0, 160);
+    }
+    const rd = (p) => { try { return parseInt(readFileSync(p, "utf8").trim(), 10); } catch { return null; } };
+    const v2limit = rd("/sys/fs/cgroup/memory.max");
+    if (v2limit !== null) {
+        out.mem = { limit_bytes: v2limit, current_bytes: rd("/sys/fs/cgroup/memory.current") };
+    } else {
+        const v1limit = rd("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+        if (v1limit !== null) out.mem = { limit_bytes: v1limit, current_bytes: rd("/sys/fs/cgroup/memory/memory.usage_in_bytes") };
+    }
+    if (!out.mem) {
+        const mi = (() => { try { return readFileSync("/proc/meminfo", "utf8"); } catch { return ""; } })();
+        const mt = /MemTotal:\s+(\d+) kB/.exec(mi);
+        const ma = /MemAvailable:\s+(\d+) kB/.exec(mi);
+        if (mt) out.mem = { host_memtotal_kB: +mt[1], host_memavail_kB: ma ? +ma[1] : null };
+    }
+    try {
+        let n = 0;
+        for (const e of readdirSync("/proc")) {
+            if (!/^\d+$/.test(e)) continue;
+            try { if ((readFileSync("/proc/" + e + "/comm", "utf8") || "").includes("chrom")) n++; } catch {}
+        }
+        out.chromium_procs = n;
+    } catch {}
+    return out;
+}
+
 const server = createServer(async (req, res) => {
     try {
         if (req.method === "OPTIONS") {
@@ -327,6 +360,7 @@ const server = createServer(async (req, res) => {
                 solvers_available: countAvailable(),
                 solver_instances: SOLVER_INSTANCES,
                 recent_solver_errors: [...solverErrors],
+                diag: sysDiag(),
                 shutting_down: shuttingDown,
             });
         }
