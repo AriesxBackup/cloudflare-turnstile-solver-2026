@@ -525,16 +525,28 @@ async function ensureBrowserConnected(b, key) {
 }
 
 // ---------- token-server protocol ----------
-function buildResultPacket(requesterId, proxy, token) {
+// Result packet: [0, requester_id(u32), proxy_len(u8), proxy,
+//                token_len(u16), token, error_len(u16), error]
+function buildResultPacket(requesterId, proxy, token, error) {
     const enc = new TextEncoder();
     const proxyBytes = enc.encode(proxy || "");
     const tokenBytes = enc.encode(token || "");
-    const pkt = new Uint8Array(6 + proxyBytes.length + tokenBytes.length);
+    const errorBytes = enc.encode(error || "");
+    const pkt = new Uint8Array(6 + proxyBytes.length + 2 + tokenBytes.length + 2 + errorBytes.length);
     pkt[0] = 0;
-    new DataView(pkt.buffer).setUint32(1, requesterId, true);
+    const view = new DataView(pkt.buffer);
+    view.setUint32(1, requesterId, true);
     pkt[5] = proxyBytes.length;
-    pkt.set(proxyBytes, 6);
-    pkt.set(tokenBytes, 6 + proxyBytes.length);
+    let off = 6;
+    pkt.set(proxyBytes, off);
+    off += proxyBytes.length;
+    view.setUint16(off, tokenBytes.length, true);
+    off += 2;
+    pkt.set(tokenBytes, off);
+    off += tokenBytes.length;
+    view.setUint16(off, errorBytes.length, true);
+    off += 2;
+    pkt.set(errorBytes, off);
     return pkt;
 }
 
@@ -657,7 +669,7 @@ async function handleSolveRequest(requesterId, proxy, fields) {
     else logErr("[solver] solve failed for requester " + requesterId + ": " + error);
     if (solverWs && solverWs.readyState === 1) {
         // Echo the proxy that was actually used (may be the always-on default).
-        solverWs.send(buildResultPacket(requesterId, useProxy ? effProxy : proxy || "", token));
+        solverWs.send(buildResultPacket(requesterId, useProxy ? effProxy : proxy || "", token, error));
         log("[solver] result sent", token ? "WITH token" : "FAIL");
     }
 }

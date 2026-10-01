@@ -187,6 +187,13 @@ function buildRequestPacket(proxy, fields) {
     return pkt;
 }
 
+const solverErrors = []; // ring of recent solver failure reasons (remote diagnostics)
+function recordSolverError(error) {
+    if (!error) return;
+    solverErrors.push({ at: new Date().toISOString(), error: String(error).slice(0, 300) });
+    if (solverErrors.length > 12) solverErrors.shift();
+}
+
 // Run one solve through the hub as a virtual requester. Every call registers
 // its own requester id, so any number of solves can be in flight at once -
 // the hub hands each one a free solver. (This replaces the old single-
@@ -208,10 +215,25 @@ function hubRequestSolve({ proxy, fields }, timeoutMs) {
                 if (!pkt || pkt.length === 0) return;
                 if (pkt[0] === 2) return finish(reject, Object.assign(new Error("no solvers available"), { code: "NO_SOLVERS" }));
                 if (pkt[0] !== 0) return;
+                // [0, proxy_len(u8), proxy, token_len(u16), token, error_len(u16), error]
+                const dv = (off) => new DataView(pkt.buffer, pkt.byteOffset + off, pkt.byteLength - off);
                 const proxyLen = pkt[1];
                 const proxyEcho = dec.decode(pkt.subarray(2, 2 + proxyLen));
-                const token = pkt.length > 2 + proxyLen ? dec.decode(pkt.subarray(2 + proxyLen)) : "";
-                finish(resolve, { success: token.length > 0, token, proxy: proxyEcho });
+                let off = 2 + proxyLen;
+                let token = "", error = "";
+                if (pkt.length >= off + 2) {
+                    const tokenLen = dv(off).getUint16(0, true);
+                    off += 2;
+                    token = pkt.length >= off + tokenLen ? dec.decode(pkt.subarray(off, off + tokenLen)) : "";
+                    off += tokenLen;
+                    if (pkt.length >= off + 2) {
+                        const errLen = dv(off).getUint16(0, true);
+                        off += 2;
+                        error = pkt.length >= off + errLen ? dec.decode(pkt.subarray(off, off + errLen)) : "";
+                    }
+                }
+                recordSolverError(error);
+                finish(resolve, { success: token.length > 0, token, proxy: proxyEcho, error });
             },
         };
         const timer = setTimeout(
@@ -304,6 +326,7 @@ const server = createServer(async (req, res) => {
                 max_inflight: MAX_INFLIGHT,
                 solvers_available: countAvailable(),
                 solver_instances: SOLVER_INSTANCES,
+                recent_solver_errors: [...solverErrors],
                 shutting_down: shuttingDown,
             });
         }
@@ -347,7 +370,7 @@ async function handleSolve(req, res) {
             return json(res, 200, { success: true, token: result.token, solve_ms, url, sitekey, action: action || undefined, proxy: result.proxy || undefined });
         }
         log(`[api] POST /solve FAIL ${solve_ms}ms (empty token) url=${url}`);
-        return json(res, 502, { success: false, error: "solver returned no token", solve_ms, url, sitekey });
+        return json(res, 502, { success: false, error: result.error || "solver returned no token", solve_ms, url, sitekey });
     } catch (e) {
         const solve_ms = Date.now() - t0;
         const status = e.code === "TIMEOUT" ? 504 : e.code === "NO_SOLVERS" ? 503 : 500;
