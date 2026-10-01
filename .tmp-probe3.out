@@ -1,5 +1,0 @@
-HEALTH-PRE: {"uptime_ms":55913,"avail":"8/8","errors":[]}
-P1 testkey/no-proxy : HTTP 502 in 538 ms solve_ms=110 success=false error="chrome exited (code 133) before publishing a DevTools port - profile dir locked by another instance?"
-P2 testkey/proxy    : HTTP 502 in 454 ms solve_ms=208 success=false error="chrome exited (code 133) before publishing a DevTools port - profile dir locked by another instance?"
-P3 capskip/proxy    : HTTP 502 in 505 ms solve_ms=209 success=false error="chrome exited (code 133) before publishing a DevTools port - profile dir locked by another instance?"
-HEALTH-POST: {"uptime_ms":57658,"avail":"8/8","errors":[{"at":"2026-10-01T11:56:38.678Z","error":"chrome exited (code 133) before publishing a DevTools port - profile dir locked by another instance?"},{"at":"2026-10-01T11:56:39.132Z","error":"chrome exited (code 133) before publishing a DevTools port - profile dir locked by another instance?"},{"at":"2026-10-01T11:56:39.613Z","error":"chrome exited (code 133) before publishing a DevTools port - profile dir locked by another instance?"}]}

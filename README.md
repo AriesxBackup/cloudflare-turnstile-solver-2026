@@ -141,7 +141,7 @@ All routes are JSON; the HTTP server and the WS hub share one port (`PORT`, defa
 
 ### GET /health
 
-Always `200`: `{ ok, version, uptime_ms, inflight, max_inflight, solvers_available, solver_instances, shutting_down }`.
+Always `200`: `{ ok, version, uptime_ms, inflight, max_inflight, active_solves, max_parallel_solves, dispatch_queue_len, solvers_available, solver_instances, recent_solver_errors, diag, shutting_down }`. `diag` exposes runtime env knobs, container memory and pids cgroup usage, ulimits, and live Chromium/thread counts — useful for diagnosing PaaS resource caps.
 
 ### GET /
 
@@ -158,6 +158,7 @@ Hub/API (read by `server.mjs`):
 | `API_KEY` | unset | Require `X-API-Key` / `Bearer` auth on `POST /solve`. |
 | `SOLVE_TIMEOUT_MS` | `120000` | Per-request solve budget (`504` beyond). |
 | `MAX_INFLIGHT` | `32` | Concurrent `/solve` cap (`429` beyond). |
+| `MAX_PARALLEL_SOLVES` | `3` | Global cap on solves running *simultaneously* across all workers; excess requests queue FIFO. Each solve holds a Chrome, so this bounds Chrome count under PaaS pids caps. |
 | `SOLVER_INSTANCES` | `1` | Solver workers to spawn (`0` = hub + API only). |
 | `CDP_PORT_BASE` | `9230` | Worker *i* gets Chrome debug port `base + i`. |
 | `FALLBACK_CDP_PORT_BASE` | `9329` | Worker *i* gets visible-fallback debug port `base + i`. |
@@ -177,6 +178,22 @@ Workers (read by `solver.mjs`; the hub sets `TOKEN_SERVER_URL`, `CDP_BASE`, `FAL
 | `RECONNECT_MS` | `3000` | Hub reconnect delay. |
 | `PREWARM_TIMEOUT_MS` | `45000` | Prewarm budget. |
 | `PAGE_INIT_SLEEP_MS` | `400` | Settle time after navigation. |
+| `PROXY_BROWSER_IDLE_TTL_MS` | `120000` | Idle cached proxy browsers are killed after this (`0` disables) so a pids cap is never left exhausted by unused Chromes. |
+| `PIDS_LAUNCH_HEADROOM` | `150` | Threads a new Chrome needs; a launch waits (see `PIDS_WAIT_MAX_MS`) while the container's pids cgroup has less than this much headroom. |
+| `PIDS_WAIT_MAX_MS` | `30000` | How long a Chrome launch waits for pids headroom before going ahead anyway. |
+
+## PaaS notes (Railway, Fly, ...)
+
+Cloudflare-facing Chrome workers are fork-hungry: one headful Chrome is ~11 processes / ~1.4k threads, and platform containers cap **pids** (Railway: `pids.max = 1000`) as well as memory. When the cap is exhausted, a *new* Chrome launch fails its first `fork`/`pthread_create` and dies silently — we observed `SIGSEGV (code -11)` every relaunch while 8 boot Chromes held the cap at exactly 1000, long before memory (1.6 GB of 24 GB) mattered.
+
+This service now self-regulates around that constraint:
+
+- When `DEFAULT_PROXY` is set, the per-worker *default* browser is **not** launched at boot (it is never used — every solve goes through the proxy browser; it is still launched lazily for a true no-proxy solve).
+- `MAX_PARALLEL_SOLVES` caps concurrent solves (each holds one Chrome) and queues the excess.
+- `PIDS_LAUNCH_HEADROOM` + `PIDS_WAIT_MAX_MS` make a launch **wait** for pids headroom instead of crashing.
+- `PROXY_BROWSER_IDLE_TTL_MS` reaps cached-but-idle proxy browsers.
+
+Result under the Railway constraint: boot = ~64/1000 pids (was pinned at 1000 with 88 Chromium procs), solve bursts peak ~840, idle settles back to ~80, and relaunch-after-kill recovers cleanly. If you still see interactive-challenge timeouts on a specific target, it is almost always **egress-IP reputation** (the datacenter egress or a shared proxy IP flagged by Cloudflare) — use a clean residential/ISP proxy per solve, not a code change.
 
 ---
 
