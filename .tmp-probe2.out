@@ -1,0 +1,2 @@
+HEALTH: {"ok":true,"version":"1.0.0","uptime_ms":62416189,"inflight":0,"max_inflight":32,"solvers_available":8,"solver_instances":8,"shutting_down":false}
+PROXY-SOLVE: HTTP 502 in 110498 ms solve_ms=110017 success=false error=solver returned no token

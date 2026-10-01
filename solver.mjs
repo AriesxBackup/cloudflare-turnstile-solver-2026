@@ -121,7 +121,15 @@ class CdpBrowser {
 
     async connect() {
         if (this.ws && this.ws.readyState === 1) return this;
-        const ver = await fetch(this.cdpBase + "/json/version").then((r) => r.json());
+        let ver = null;
+        try {
+            ver = await fetch(this.cdpBase + "/json/version").then((r) => r.json());
+        } catch (e) {
+            throw new Error("CDP unreachable at " + this.cdpBase + ": " + e.message);
+        }
+        if (!ver || !ver.webSocketDebuggerUrl) {
+            throw new Error("CDP at " + this.cdpBase + " returned no webSocketDebuggerUrl");
+        }
         this.ws = await openWs(ver.webSocketDebuggerUrl);
         this.ws.onmessage = (ev) => {
             const raw = typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data);
@@ -162,6 +170,13 @@ class CdpBrowser {
                 this.pending.delete(msg.id);
                 msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
             }
+        };
+        this.ws.onclose = () => {
+            // Chrome died or the CDP socket dropped: reject every in-flight call
+            // immediately so solves fail fast instead of hanging to the watchdog.
+            const pend = [...this.pending.values()];
+            this.pending.clear();
+            for (const p of pend) p.reject(new Error("CDP connection closed"));
         };
         return this;
     }
@@ -416,6 +431,9 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
         base = "http://127.0.0.1:" + port;
         const t0 = Date.now();
         while (Date.now() - t0 < 30000) {
+            if (proc.exitCode !== null) {
+                throw new Error("chrome exited (code " + proc.exitCode + ") before serving DevTools on port " + port);
+            }
             try { if ((await fetch(base + "/json/version")).ok) break; } catch {}
             await sleep(400);
         }
@@ -427,6 +445,12 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
 }
 
 async function launchManagedDefaultBrowser() {
+    // A crashed Chrome can leave a stale SingletonLock/Socket in its profile dir;
+    // relaunching into the same dir makes the new Chrome exit 133 immediately
+    // ("profile in use by another process"). We only relaunch after the previous
+    // process is confirmed dead, so always start from a pristine dir - the same
+    // approach the proxy path already uses (see launchProxyBrowser).
+    try { rmSync(MANAGED_PROFILE_DIR, { recursive: true, force: true }); } catch {}
     const port = new URL(DEFAULT_CDP).port || 9222;
     _port = Math.max(_port, port); // nextPort() must never hand out the default CDP port
     const b = await launchChrome({ name: "default", port, dir: MANAGED_PROFILE_DIR, extraArgs: [] });
@@ -443,6 +467,9 @@ async function launchFallbackBrowser() {
     const port = FALLBACK_CDP_PORT || nextPort();
     if (FALLBACK_CDP_PORT) _port = Math.max(_port, port);
     const dir = join(__dir, ".state", SOLVER_INSTANCE ? `chrome-fallback-${SOLVER_INSTANCE}` : "chrome-fallback");
+    // Same stale-singleton rationale as launchManagedDefaultBrowser: a relaunch
+    // into a dir left behind by a crashed Chrome exits 133 before CDP comes up.
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
     const b = await launchChrome({ name: "fallback", port, dir, extraArgs: [], headless: false });
     browsers.set(key, b);
     log("# visible fallback browser ready on http://127.0.0.1:" + port);
@@ -503,25 +530,42 @@ async function launchProxyBrowser(proxy) {
     return b;
 }
 
-// Ensure the browser is connected, relaunching it if its Chrome process died.
+// Ensure the browser is connected, relaunching it if its Chrome process died OR
+// its CDP connection is gone/unrecoverable. Any unusable browser is killed and
+// replaced so solves never fast-fail on a stale/broken endpoint.
 async function ensureBrowserConnected(b, key) {
     if (b.ws && b.ws.readyState === 1) return b;
+    let reason = "";
     if (b.proc && b.proc.exitCode !== null) {
-        logErr("# " + b.name + " chrome exited (code " + b.proc.exitCode + "); relaunching");
-        if (key === "default") {
-            await launchManagedDefaultBrowser();
-            return defaultBrowser();
+        reason = "chrome exited (code " + b.proc.exitCode + ")";
+    } else if (b.proc) {
+        // Process metadata still says alive, but the CDP connection is gone.
+        // Try one direct reconnect; if that fails the browser is unusable
+        // (stale exit code, half-dead process, ...) so kill + relaunch it.
+        try {
+            await b.connect();
+            return b;
+        } catch (e) {
+            reason = "CDP reconnect failed (" + e.message + ")";
         }
-        if (key === "fallback") {
-            browsers.delete(key);
-            return launchFallbackBrowser();
-        }
-        const pkey = b.browserKey || key; // "proxy:<sha1>" map key, not the browser name
-        browsers.delete(pkey);
-        return launchProxyBrowser(b.proxy);
+    } else {
+        reason = "no browser process";
     }
-    await b.connect(); // throws if the endpoint is unreachable
-    return b;
+    logErr("# " + b.name + " " + reason + "; relaunching");
+    // Kill any surviving process so a zombie can never hold the CDP port or the
+    // profile dir's singleton lock for the fresh browser.
+    try { if (b.proc && b.proc.exitCode === null) b.proc.kill("SIGKILL"); } catch {}
+    if (key === "default") {
+        await launchManagedDefaultBrowser();
+        return defaultBrowser();
+    }
+    if (key === "fallback") {
+        browsers.delete(key);
+        return launchFallbackBrowser();
+    }
+    const pkey = b.browserKey || key; // "proxy:<sha1>" map key, not the browser name
+    browsers.delete(pkey);
+    return launchProxyBrowser(b.proxy);
 }
 
 // ---------- token-server protocol ----------
@@ -749,6 +793,9 @@ function shutdown() {
 // restart is already warm instead of paying launch + navigate + prime + 55s poll.
 // Awaited during boot (with a cap) so it can never race a solve on the same page.
 async function prewarmFallback() {
+    // Pre-warm only on worker 1: every worker prewarming at boot means N extra
+    // headful Chrome+page stacks under one container's memory ceiling.
+    if (SOLVER_INSTANCE > 1) return;
     const lt = solverState.lastTarget;
     if (!lt || !solverState.fallbackHosts.length) return;
     let origin = "";
@@ -778,6 +825,9 @@ async function prewarmFallback() {
 // before the request even arrives (near-instant first solve).
 async function prewarmProxy() {
     if (!DEFAULT_PROXY) return;
+    // Same fan-out cap as prewarmFallback: only worker 1 pre-warms a proxy
+    // browser at boot, so N workers no longer mean N extra warm Chromes.
+    if (SOLVER_INSTANCE > 1) return;
     const lt = solverState.lastTarget;
     if (!lt || !/^https?:\/\//i.test(lt.url)) return;
     try {

@@ -11,12 +11,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dumb-init \
     && rm -rf /var/lib/apt/lists/*
 
-# Wrapper: run Chrome through Xvfb so the workers' "visible" fallback browser
-# (used when Cloudflare challenges the headless fingerprint) works without a
-# real display. Headless browsers pass through unchanged. The container runs
-# as root, so CHROME_ARGS_EXTRA must include --no-sandbox (set in Railway /
-# docker-compose.yml).
-RUN printf '#!/bin/sh\nexec xvfb-run -a /usr/bin/chromium "$@"\n' > /usr/local/bin/solver-chrome \
+# Wrapper: run Chrome through a SINGLE persistent Xvfb (:99) so the workers'
+# "visible" fallback browser works without a real display, and every relaunch
+# reconnects to the same healthy display instead of spinning up yet another
+# Xvfb under memory pressure (per-launch `xvfb-run -a` made Chromium hit fatal
+# startup errors / SIGTRAP (exit 133) when many instances raced at once). The
+# container runs as root, so CHROME_ARGS_EXTRA must include --no-sandbox (set
+# in Railway / docker-compose.yml).
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    '# Persistent shared Xvfb on :99. Reused by every (re)launched Chrome.' \
+    'if [ -e /tmp/.X11-unix/X99 ] && [ -f /tmp/xvfb.pid ] && kill -0 "$(cat /tmp/xvfb.pid)" 2>/dev/null; then' \
+    '    :' \
+    'else' \
+    '    rm -f /tmp/.X11-unix/X99 /tmp/xvfb.pid' \
+    '    Xvfb :99 -screen 0 1600x1000x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &' \
+    '    echo $! > /tmp/xvfb.pid' \
+    '    i=0' \
+    '    while [ ! -e /tmp/.X11-unix/X99 ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done' \
+    'fi' \
+    'export DISPLAY=:99' \
+    'exec /usr/bin/chromium "$@"' > /usr/local/bin/solver-chrome \
     && chmod +x /usr/local/bin/solver-chrome
 
 WORKDIR /app
