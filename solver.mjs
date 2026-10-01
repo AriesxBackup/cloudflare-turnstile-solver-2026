@@ -403,7 +403,7 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
     mkdirSync(dir, { recursive: true });
     log("config: chrome=" + CHROME_PATH + " headless=" + HEADLESS + " args=" + [...CHROME_ARGS_EXTRA, ...extraArgs].join(" "));
     log("# launching Chrome (" + (useHeadless ? "headless" : "visible") + ") on port " + (port || "auto"));
-    const proc = spawn(CHROME_PATH, args, { stdio: "ignore", windowsHide: true });
+    const proc = spawn(CHROME_PATH, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
     proc.on("error", (e) => logErr("# chrome spawn error:", e.message));
     // Keep the last ~4 KB of Chrome's stderr so an early crash (SIGSEGV/133/etc.)
     // can report the REAL FATAL line instead of an opaque exit code.

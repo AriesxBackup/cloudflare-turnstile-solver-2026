@@ -327,6 +327,28 @@ function sysDiag() {
         const ma = /MemAvailable:\s+(\d+) kB/.exec(mi);
         if (mt) out.mem = { host_memtotal_kB: +mt[1], host_memavail_kB: ma ? +ma[1] : null };
     }
+    // cgroup pids limit/current + thread count: thread exhaustion crashes Chromium
+    // with silent SIGSEGV (pthread_create fails -> CHECK -> native crash).
+    const pidsLimit = rd("/sys/fs/cgroup/pids.max");
+    if (pidsLimit !== null) out.pids = { max: pidsLimit, current: rd("/sys/fs/cgroup/pids.current") };
+    try {
+        let threads = 0;
+        let procs = 0;
+        for (const e of readdirSync("/proc")) {
+            if (!/^\d+$/.test(e)) continue;
+            procs++;
+            try { threads += parseInt((readFileSync("/proc/" + e + "/stat", "utf8").match(/^\d+ \([^)]*\) \S (\d+)/) || [])[1] || "0", 10); } catch {}
+        }
+        out.threads_total = threads;
+        out.procs_total = procs;
+    } catch {}
+    try {
+        const ulimits = readFileSync("/proc/self/limits", "utf8");
+        const nf = /Max open files\s+(\S+)/.exec(ulimits);
+        const np = /Max processes\s+(\S+)/.exec(ulimits);
+        if (nf) out.ulimit_nofile = nf[1];
+        if (np) out.ulimit_nproc = np[1];
+    } catch {}
     try {
         let n = 0;
         for (const e of readdirSync("/proc")) {
