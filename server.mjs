@@ -44,6 +44,12 @@ const HOST = process.env.API_HOST || (process.env.RAILWAY_ENVIRONMENT ? "0.0.0.0
 const API_KEY = process.env.API_KEY || "";
 const SOLVE_TIMEOUT_MS = parseInt(process.env.SOLVE_TIMEOUT_MS || "120000", 10);
 const MAX_INFLIGHT = Math.max(1, parseInt(process.env.MAX_INFLIGHT || "32", 10) || 32);
+// Cap how many solves run SIMULTANEOUSLY across all workers. Each solve holds a
+// Chrome (~6 procs / ~200 threads each), and PaaS pids caps (~1000) are easily
+// exhausted by full parallelism across many workers - the resulting fork
+// failure crashes the NEW Chrome with a silent SIGSEGV. Excess requests queue
+// FIFO instead of erroring. Raise/lower per deployment (env override).
+const MAX_PARALLEL_SOLVES = Math.max(1, parseInt(process.env.MAX_PARALLEL_SOLVES || "3", 10) || 3);
 const SOLVER_INSTANCES = Math.max(0, parseInt(process.env.SOLVER_INSTANCES === undefined ? "1" : process.env.SOLVER_INSTANCES, 10) || 0);
 const CDP_PORT_BASE = parseInt(process.env.CDP_PORT_BASE || "9230", 10);
 const FALLBACK_CDP_PORT_BASE = parseInt(process.env.FALLBACK_CDP_PORT_BASE || "9329", 10);
@@ -100,20 +106,37 @@ function pickSolver(uaWanted) {
 // Dispatch a requester packet [1, proxy_len, proxy, fields...] to a free
 // solver with the requester id injected after the proxy (hub->solver):
 // [1, proxy_len, proxy, requester_id(u32), fields...]
+// Globally rate-limited by MAX_PARALLEL_SOLVES: extra requests queue FIFO so a
+// pids-capped PaaS container never over-fans Chromes (each solve holds one).
+const dispatchQueue = []; // { conn, pkt } FIFO
+let activeSolves = 0;
+
+function pumpDispatch() {
+    while (activeSolves < MAX_PARALLEL_SOLVES && dispatchQueue.length > 0) {
+        // Peek for a free solver BEFORE dequeuing: if none is free the queue
+        // must wait (a solve is in flight), and pump runs again when a solver
+        // reports back (case 0). This keeps bursts queued instead of erroring.
+        const solverId = pickSolver(null);
+        if (solverId === null) break;
+        const sconn = connections.get(solverId);
+        if (!sconn) { unregister(solverId); continue; }
+        const { conn, pkt } = dispatchQueue.shift();
+        if (pkt.length < 2 || pkt[0] !== 1) continue;
+        const proxyLen = pkt[1];
+        const head = pkt.subarray(0, 2 + proxyLen); // [1, proxy_len, proxy]
+        const rest = pkt.subarray(2 + proxyLen);    // fields...
+        activeSolves++;
+        const out = new Uint8Array(head.length + 4 + rest.length);
+        out.set(head, 0);
+        new DataView(out.buffer).setUint32(head.length, conn.id >>> 0, true);
+        out.set(rest, head.length + 4);
+        sconn.send(out);
+    }
+}
+
 function dispatchRequest(conn, pkt) {
-    if (pkt.length < 2 || pkt[0] !== 1) return;
-    const proxyLen = pkt[1];
-    const head = pkt.subarray(0, 2 + proxyLen); // [1, proxy_len, proxy]
-    const rest = pkt.subarray(2 + proxyLen);    // fields...
-    const solverId = pickSolver(null);
-    if (solverId === null) return conn.send(new Uint8Array([2])); // no solver free
-    const sconn = connections.get(solverId);
-    if (!sconn) { unregister(solverId); return conn.send(new Uint8Array([2])); }
-    const out = new Uint8Array(head.length + 4 + rest.length);
-    out.set(head, 0);
-    new DataView(out.buffer).setUint32(head.length, conn.id >>> 0, true);
-    out.set(rest, head.length + 4);
-    sconn.send(out);
+    dispatchQueue.push({ conn, pkt });
+    pumpDispatch();
 }
 
 // Handle one binary hub message from any connection (protocol in file header).
@@ -151,6 +174,8 @@ function handleHubMessage(conn, data) {
                 if (!q) { q = new Set(); availableByUa.set(sua, q); }
                 q.add(conn.id);
             }
+            if (activeSolves > 0) activeSolves--;
+            pumpDispatch(); // a slot freed: admit the next queued solve
             return;
         }
         case 2: { // solver registration: [2, ...user-agent]
@@ -379,6 +404,9 @@ const server = createServer(async (req, res) => {
                 uptime_ms: Date.now() - startedAt,
                 inflight,
                 max_inflight: MAX_INFLIGHT,
+                active_solves: activeSolves,
+                max_parallel_solves: MAX_PARALLEL_SOLVES,
+                dispatch_queue_len: dispatchQueue.length,
                 solvers_available: countAvailable(),
                 solver_instances: SOLVER_INSTANCES,
                 recent_solver_errors: [...solverErrors],

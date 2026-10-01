@@ -45,6 +45,14 @@ const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "110000", 
 const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10);
 const PREWARM_TIMEOUT_MS = parseInt(process.env.PREWARM_TIMEOUT_MS || "45000", 10);
 const PAGE_INIT_SLEEP_MS = parseInt(process.env.PAGE_INIT_SLEEP_MS || "400", 10);
+// Idle proxy browsers are reaped after this long so a PaaS pids cap never
+// stays exhausted by cached-but-unused Chromes. 0 disables the sweep.
+const PROXY_BROWSER_IDLE_TTL_MS = parseInt(process.env.PROXY_BROWSER_IDLE_TTL_MS || "120000", 10);
+// Headroom (threads) a new Chrome needs before we allow a launch. When the
+// pids cgroup is near its ceiling, launching anyway fork-fails and the NEW
+// Chrome dies with a silent SIGSEGV - so launchChrome waits for a slot.
+const PIDS_LAUNCH_HEADROOM = parseInt(process.env.PIDS_LAUNCH_HEADROOM || "150", 10);
+const PIDS_WAIT_MAX_MS = parseInt(process.env.PIDS_WAIT_MAX_MS || "30000", 10);
 const HEADLESS = process.env.HEADLESS === undefined ? "1" : process.env.HEADLESS;
 // Managed by default: hub-spawned workers (and standalone `node solver.mjs`)
 // launch and own their Chrome at CDP_BASE. Set MANAGE_BROWSER=0 to attach to an
@@ -117,6 +125,8 @@ class CdpBrowser {
         this.proxyAuth = null; // { username, password } for authenticated proxies
         this.prewarmToken = null; // { key, token, at } token pre-minted at boot prewarm
         this._lock = null; // per-browser mutex: prewarm and solves never interleave evals
+        this.busy = 0; // solves/prewarms currently holding this browser
+        this.lastUsed = Date.now(); // for idle reaping (see sweepIdleBrowsers)
     }
 
     async connect() {
@@ -212,9 +222,12 @@ class CdpBrowser {
         let release;
         this._lock = new Promise((r) => { release = r; });
         if (prev) await prev.catch(() => {});
+        this.busy++;
         try {
             return await fn();
         } finally {
+            this.busy--;
+            this.lastUsed = Date.now();
             release();
         }
     }
@@ -383,6 +396,46 @@ function defaultBrowser() {
     return browsers.get("default");
 }
 
+// If the container's pids cgroup is nearly full, a new Chrome would fork-fail
+// and die with a silent SIGSEGV (observed on Railway: pids.max=1000 pinned at
+// 1000, every relaunch crashed code -11). Wait for a free slot instead of
+// launching into a wall. The idle sweep (sweepIdleBrowsers) frees browsers.
+async function waitForPidsHeadroom() {
+    if (process.platform !== "linux") return;
+    const rd = (p) => { try { return parseInt(readFileSync(p, "utf8").trim(), 10); } catch { return null; } };
+    const max = rd("/sys/fs/cgroup/pids.max");
+    if (!max || max <= 0) return; // unlimited
+    const t0 = Date.now();
+    while (true) {
+        const cur = rd("/sys/fs/cgroup/pids.current") || 0;
+        if (cur + PIDS_LAUNCH_HEADROOM < max) return;
+        if (Date.now() - t0 > PIDS_WAIT_MAX_MS) {
+            logErr("[solver] pids cgroup still full (" + cur + "/" + max + ") after " + PIDS_WAIT_MAX_MS + "ms; launching anyway");
+            return;
+        }
+        await sleep(500);
+    }
+}
+
+// Cached proxy browsers that have been idle too long are killed, returning the
+// container's pids budget (threads count toward the cap) so future launches
+// can never hit the fork-failure wall. Only proxy browsers are reaped - the
+// default/fallback endpoints stay alive for instant no-proxy solves.
+function sweepIdleBrowsers() {
+    if (!PROXY_BROWSER_IDLE_TTL_MS) return;
+    for (const [key, b] of browsers) {
+        if (key === "default" || key === "fallback") continue;
+        if (!b.proxy) continue; // only proxy browsers (named by their proxy string)
+        if (b.busy > 0) continue; // never reap a browser mid-solve
+        if (Date.now() - b.lastUsed < PROXY_BROWSER_IDLE_TTL_MS) continue;
+        const idleS = Math.round((Date.now() - b.lastUsed) / 1000);
+        log("[solver] reaping idle proxy browser " + key + " (idle " + idleS + "s)");
+        try { if (b.proc && b.proc.exitCode === null) b.proc.kill("SIGKILL"); } catch {}
+        browsers.delete(key);
+    }
+}
+setInterval(sweepIdleBrowsers, 30000).unref();
+
 async function launchChrome({ name, port, dir, extraArgs, headless }) {
     const useHeadless = headless === undefined ? HEADLESS === "1" : !!headless;
     const args = [
@@ -395,12 +448,21 @@ async function launchChrome({ name, port, dir, extraArgs, headless }) {
         "--metrics-recording-only", "--mute-audio",
         "--disable-blink-features=AutomationControlled",
         "--remote-allow-origins=*",
+        // Keep per-Chrome process/thread count low: site isolation spawns a
+        // renderer per origin and a separate GPU process adds hundreds of
+        // threads. PaaS pids caps (~1000) are easily exhausted by 8 workers
+        // worth of full Chromes, which makes any NEW launch fork-fail with a
+        // silent SIGSEGV. A single-renderer Chrome is plenty for a Turnstile
+        // widget and is indistinguishable from a normal low-memory user agent.
+        "--disable-features=site-per-process,IsolateOrigins",
+        ...(process.platform === "linux" ? ["--disable-gpu-process"] : []),
         ...(useHeadless ? ["--headless=new", "--hide-scrollbars"] : []),
         ...extraArgs,
         ...CHROME_ARGS_EXTRA,
         "about:blank",
     ];
     mkdirSync(dir, { recursive: true });
+    await waitForPidsHeadroom();
     log("config: chrome=" + CHROME_PATH + " headless=" + HEADLESS + " args=" + [...CHROME_ARGS_EXTRA, ...extraArgs].join(" "));
     log("# launching Chrome (" + (useHeadless ? "headless" : "visible") + ") on port " + (port || "auto"));
     const proc = spawn(CHROME_PATH, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
@@ -543,7 +605,7 @@ async function launchProxyBrowser(proxy) {
 // its CDP connection is gone/unrecoverable. Any unusable browser is killed and
 // replaced so solves never fast-fail on a stale/broken endpoint.
 async function ensureBrowserConnected(b, key) {
-    if (b.ws && b.ws.readyState === 1) return b;
+    if (b.ws && b.ws.readyState === 1) { b.lastUsed = Date.now(); return b; }
     let reason = "";
     if (b.proc && b.proc.exitCode !== null) {
         reason = "chrome exited (code " + b.proc.exitCode + ")";
@@ -884,7 +946,16 @@ async function prewarmProxy() {
     log("[solver] boot: instance=" + SOLVER_INSTANCE + " headless=" + HEADLESS + " chrome=" + CHROME_PATH + " default_proxy=" + (DEFAULT_PROXY ? "SET" : "none") + " cdp=" + DEFAULT_CDP + " args=" + (CHROME_ARGS_EXTRA.join(" ") || "(none)"));
 
     if (MANAGE_BROWSER) {
-        await launchManagedDefaultBrowser();
+        if (DEFAULT_PROXY) {
+            // With an always-on proxy every solve uses a proxy browser, so the
+            // "default" Chrome would only burn process/thread budget at boot
+            // (its 88 procs / ~12k threads routinely exhaust PaaS pids caps and
+            // make every subsequent launch segfault). It is still launched
+            // lazily if a true no-proxy solve ever arrives.
+            log("[solver] DEFAULT_PROXY set - skipping boot launch of the default browser");
+        } else {
+            await launchManagedDefaultBrowser();
+        }
     } else {
         // Wait for the external Chrome at CDP_BASE; retry so startup order does not matter.
         while (!shuttingDown) {
